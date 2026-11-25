@@ -1,0 +1,16 @@
+# Data are licensed or cached and never go in this repository.
+data/
+_cache/
+cache/
+*.parquet
+*.csv
+*.csv.gz
+*.jsonl
+*.env
+__pycache__/
+.DS_Store
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.toc

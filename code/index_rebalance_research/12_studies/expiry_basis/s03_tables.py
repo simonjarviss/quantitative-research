@@ -1,0 +1,87 @@
+"""Tables for RESULTS.md -> report_tables.md and table_*.csv."""
+import numpy as np
+import pandas as pd
+from common import DATA, HERE, TYPES
+
+d = pd.read_csv(DATA / "auction_move_daily.csv", parse_dates=["date"])
+d = d[d.date >= "2010-01-01"]
+STALE = 150   # |a| >= 150 bp = stale settlement of an illiquid contract (e.g. FTSE 250 June 2020 on 20 Mar 2020)
+n_stale = (d.a_bp.abs() >= STALE).groupby(d.idx).sum()
+d = d[d.a_bp.abs() < STALE]
+r = pd.read_csv(DATA / "roll.csv", parse_dates=["expiry"])
+out = []
+
+
+def tstat(x):
+    return x.mean() / x.std() * np.sqrt(len(x))
+
+
+def md(df, title):
+    out.append(f"### {title}\n\n" + df.to_markdown() + "\n")
+
+
+# T1: settlement timing inferred from normal days, by period (the regime changed for FTSE MIB and S&P/TSX)
+n = d[d.type == "6 other"].copy()
+n["period"] = pd.cut(n.date.dt.year, [2009, 2014, 2019, 2023, 2026], labels=["2010-14", "2015-19", "2020-23", "2024-26"])
+t1 = n.groupby(["idx", "period"], observed=True).a_bp.apply(lambda x: x.abs().median()).unstack().round(1)
+t1["sd 2010-26"] = n.groupby("idx").a_bp.std().round(1)
+t1["stale days dropped"] = n_stale.reindex(t1.index).fillna(0).astype(int)
+t1["futures settle (2024-26)"] = np.where(t1["2024-26"] > 4, "before the cash close", np.where(t1["2024-26"] > 2, "near the close", "on the close"))
+t1 = t1.sort_values("2024-26", ascending=False)
+t1.to_csv(HERE / "table_settle_timing.csv")
+md(t1, "T1. Normal days: median |index move after futures settlement| (bp), by period")
+
+ASYNC = t1.index[t1["2024-26"] > 4].tolist()
+SYNC = ["CAC 40", "AEX"]
+a = d[d.idx.isin(ASYNC)]
+# T2: scale by day type
+g = a.groupby(["idx", "type"]).a_bp
+t2 = pd.concat({"median |a|": g.apply(lambda x: x.abs().median()).unstack(),
+                "sd": g.std().unstack(), "p90 |a|": g.apply(lambda x: x.abs().quantile(.9)).unstack()}, axis=1).round(1)
+t2.to_csv(HERE / "table_scale_by_type.csv")
+for k in ["median |a|", "sd", "p90 |a|"]:
+    md(t2[k][TYPES], f"T2. Index move after futures settlement, {k} (bp), 2010-2026, by day type")
+md(a.groupby(["idx", "type"]).size().unstack()[TYPES], "T2n. Index-days by type")
+# ratio event / normal, pooled across async indices (per index then median)
+rat = (t2["sd"][["1 Q-expiry/rebal", "2 MSCI review", "3 quarter-end", "4 other month-end"]].div(t2["sd"]["6 other"], axis=0))
+md(rat.round(2), "T2r. SD on the day type / SD on normal days")
+
+# T3: sign, one observation per date (mean over async indices)
+rows = []
+for lab, aa in [("all dates", a), ("excl. Mar-Apr 2020", a[~a.date.between("2020-03-01", "2020-04-30")]),
+                ("2018-2026", a[a.date >= "2018-01-01"]), ("control: CAC 40 + AEX (settle on the close)", d[d.idx.isin(SYNC)])]:
+    p = aa.groupby(["date", "type"]).a_bp.mean().reset_index()
+    for ty, x in p.groupby("type").a_bp:
+        rows.append((lab, ty, len(x), x.mean(), x.std(), tstat(x), (x > 0).mean()))
+t3 = pd.DataFrame(rows, columns=["sample", "type", "dates", "mean bp", "sd", "t", "share > 0"]).round(2)
+t3.to_csv(HERE / "table_sign.csv", index=False)
+md(t3.set_index(["sample", "type"]), "T3. Signed move, one observation per date (mean over the async indices)")
+
+# T4: permanence
+def ols(x, y):
+    X = np.c_[np.ones(len(x)), x]
+    b, *_ = np.linalg.lstsq(X, y, rcond=None); e = y - X @ b
+    se = np.sqrt(np.diag(e @ e / (len(y) - 2) * np.linalg.inv(X.T @ X)))
+    return b[1], se[1], len(y)
+rows = []
+for idx, gg in a.groupby("idx"):
+    for lab, s in [("normal", gg[gg.type == "6 other"]), ("Q-expiry + MSCI", gg[gg.type.isin(TYPES[:2])])]:
+        b, se, k = ols(s.a_bp.values, s.fret_next_bp.values)
+        rows.append((idx, lab, round(b, 2), round(se, 2), k))
+t4 = pd.DataFrame(rows, columns=["idx", "days", "beta", "se", "n"]).set_index(["idx", "days"]).unstack()
+t4.to_csv(HERE / "table_permanence.csv")
+md(t4, "T4. Futures return settle t -> settle t+1 regressed on the move a_t (beta 1 = the auction move stays; 0 = the cash index gives it back)")
+
+# T5: roll liquidity on quarterly expiry days (2015+)
+r = r[r.idx.isin([x for x in ASYNC + ["S&P/TSX 60", "FTSE MIB"] if x != "IBEX 35"])]   # quarterly-only contracts (IBEX, CAC, AEX list serial months)
+rr = r[r.expiry >= "2015-01-01"].groupby("idx")[["next_vol_on_E_x_front_adv", "next_share_E-5..E-1", "expiring_vol_on_E_x_adv"]].median().round(2)
+rr["expiries"] = r[r.expiry >= "2015-01-01"].groupby("idx").size()
+rr.to_csv(HERE / "table_roll.csv")
+md(rr, "T5. Quarterly expiry days 2015-2026 (medians): volume in the next contract on the expiry day, x the expiring contract's ADV on days -30..-11; next contract's share of volume over the 5 days before")
+
+# T6: recent event days, per index
+rec = a[(a.date >= "2024-01-01") & a.type.isin(TYPES[:2])].pivot_table(index=["date", "type"], columns="idx", values="a_bp").round(0)
+md(rec, "T6. Recent quarterly-expiry and MSCI days: index move after futures settlement (bp)")
+
+(HERE / "report_tables.md").write_text("# expiry_basis: report tables (generated by s03_tables.py)\n\n" + "\n".join(out))
+print("\n".join(out))
